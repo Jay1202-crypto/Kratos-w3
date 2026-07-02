@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-Step 3: Mission Control GUI with real Nav2 dispatch.
+Step 4: Mission Control GUI with Nav2 dispatch + live telemetry panel.
 
-Combines:
-  - Step 1's threading pattern (rclpy executor on a background QThread,
-    Qt signals crossing to the GUI thread)
-  - Step 2's waypoint input UI + validation
-  - Assignment 2's mission_client.py Nav2 action client logic,
-    ported into signal-emitting callbacks instead of get_logger() calls
+Adds on top of Step 3:
+  - Subscription to /odom for live position, heading, and velocity
+  - A telemetry panel in the GUI showing this data, updated via signals
+  - An Emergency Stop button that publishes a zero Twist on /cmd_vel
 
 Run with:
     python3 main.py
@@ -15,18 +13,20 @@ Run with:
 
 import sys
 import threading
+import math
 
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.executors import SingleThreadedExecutor
 from nav2_msgs.action import NavigateToPose
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Twist
+from nav_msgs.msg import Odometry
 
 from PyQt5.QtCore import QObject, pyqtSignal, QThread, Qt
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QLineEdit, QPushButton,
-    QTextEdit, QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox
+    QTextEdit, QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox, QGroupBox
 )
 
 
@@ -42,6 +42,8 @@ class MissionSignals(QObject):
     mission_complete = pyqtSignal(int, int)      # (succeeded, total)
     server_unavailable = pyqtSignal()
     goal_rejected = pyqtSignal(int)        # index
+    odom_updated = pyqtSignal(float, float, float, float, float)
+    # (x, y, yaw_degrees, linear_x, angular_z)
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +57,34 @@ class MissionControlNode(Node):
         self.current_index = 0
         self.succeeded = 0
         self._action_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
+
+        # --- Telemetry: subscribe to /odom for live position/velocity ---
+        self._odom_sub = self.create_subscription(
+            Odometry, '/odom', self.odom_callback, 10)
+
+        # --- Emergency stop: publisher for /cmd_vel ---
+        self._cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+
+    def odom_callback(self, msg: Odometry):
+        pos = msg.pose.pose.position
+        ori = msg.pose.pose.orientation
+        twist = msg.twist.twist
+
+        # Convert quaternion z/w to yaw (degrees). Assumes a ground robot
+        # with roll/pitch ~0, which holds for TurtleBot on a flat plane.
+        yaw_rad = math.atan2(
+            2.0 * (ori.w * ori.z + ori.x * ori.y),
+            1.0 - 2.0 * (ori.y * ori.y + ori.z * ori.z)
+        )
+        yaw_deg = math.degrees(yaw_rad)
+
+        self.signals.odom_updated.emit(
+            pos.x, pos.y, yaw_deg, twist.linear.x, twist.angular.z)
+
+    def emergency_stop(self):
+        stop_msg = Twist()  # all fields default to 0.0
+        self._cmd_vel_pub.publish(stop_msg)
+        self.signals.log_message.emit('EMERGENCY STOP: zero velocity published to /cmd_vel')
 
     def start_mission(self, waypoints):
         self.waypoints = waypoints
@@ -154,9 +184,10 @@ class RosThread(QThread):
 # GUI
 # ---------------------------------------------------------------------------
 class MainWindow(QMainWindow):
-    # Signal used to safely trigger start_mission() on the ROS thread
-    # from a GUI button click (cross-thread call, done via queued signal).
+    # Signals used to safely trigger ROS-side calls on the ROS thread
+    # from GUI button clicks (cross-thread calls, done via queued signals).
     request_start_mission = pyqtSignal(list)
+    request_estop = pyqtSignal()
 
     def __init__(self, node: MissionControlNode, signals: MissionSignals):
         super().__init__()
@@ -202,6 +233,39 @@ class MainWindow(QMainWindow):
         button_row.addWidget(self.dispatch_button)
         main_layout.addLayout(button_row)
 
+        # --- Telemetry panel ---
+        telemetry_box = QGroupBox('Live Telemetry (/odom)')
+        telemetry_layout = QGridLayout()
+
+        telemetry_layout.addWidget(QLabel('Position X:'), 0, 0)
+        self.telem_x_label = QLabel('--')
+        telemetry_layout.addWidget(self.telem_x_label, 0, 1)
+
+        telemetry_layout.addWidget(QLabel('Position Y:'), 0, 2)
+        self.telem_y_label = QLabel('--')
+        telemetry_layout.addWidget(self.telem_y_label, 0, 3)
+
+        telemetry_layout.addWidget(QLabel('Heading (yaw):'), 1, 0)
+        self.telem_yaw_label = QLabel('--')
+        telemetry_layout.addWidget(self.telem_yaw_label, 1, 1)
+
+        telemetry_layout.addWidget(QLabel('Linear vel:'), 1, 2)
+        self.telem_linear_label = QLabel('--')
+        telemetry_layout.addWidget(self.telem_linear_label, 1, 3)
+
+        telemetry_layout.addWidget(QLabel('Angular vel:'), 2, 0)
+        self.telem_angular_label = QLabel('--')
+        telemetry_layout.addWidget(self.telem_angular_label, 2, 1)
+
+        self.estop_button = QPushButton('EMERGENCY STOP')
+        self.estop_button.setStyleSheet(
+            'background-color: #c0392b; color: white; font-weight: bold;')
+        self.estop_button.clicked.connect(self.on_estop_clicked)
+        telemetry_layout.addWidget(self.estop_button, 2, 2, 1, 2)
+
+        telemetry_box.setLayout(telemetry_layout)
+        main_layout.addWidget(telemetry_box)
+
         # --- Log panel ---
         log_label = QLabel('Mission Log:')
         main_layout.addWidget(log_label)
@@ -220,11 +284,14 @@ class MainWindow(QMainWindow):
         self.signals.mission_complete.connect(self.on_mission_complete)
         self.signals.server_unavailable.connect(self.on_server_unavailable)
         self.signals.goal_rejected.connect(self.on_goal_rejected)
+        self.signals.odom_updated.connect(self.on_odom_updated)
 
-        # Cross-thread trigger: connect with a queued connection so
-        # start_mission() actually executes on the ROS thread, not the GUI thread.
+        # Cross-thread triggers: connect with queued connections so these
+        # actually execute on the ROS thread, not the GUI thread.
         self.request_start_mission.connect(
             self.node.start_mission, type=Qt.QueuedConnection)
+        self.request_estop.connect(
+            self.node.emergency_stop, type=Qt.QueuedConnection)
 
     def on_dispatch_clicked(self):
         waypoints = []
@@ -280,6 +347,17 @@ class MainWindow(QMainWindow):
 
     def on_goal_rejected(self, index):
         QMessageBox.warning(self, 'Goal Rejected', f'Waypoint {index} was rejected by Nav2.')
+
+    def on_estop_clicked(self):
+        self.request_estop.emit()
+        self.log('Emergency stop requested by operator.')
+
+    def on_odom_updated(self, x, y, yaw_deg, linear_x, angular_z):
+        self.telem_x_label.setText(f'{x:.2f} m')
+        self.telem_y_label.setText(f'{y:.2f} m')
+        self.telem_yaw_label.setText(f'{yaw_deg:.1f} deg')
+        self.telem_linear_label.setText(f'{linear_x:.2f} m/s')
+        self.telem_angular_label.setText(f'{angular_z:.2f} rad/s')
 
     def log(self, message: str):
         self.log_panel.append(message)
