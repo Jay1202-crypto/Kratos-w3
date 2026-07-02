@@ -44,6 +44,7 @@ class MissionSignals(QObject):
     goal_rejected = pyqtSignal(int)        # index
     odom_updated = pyqtSignal(float, float, float, float, float)
     # (x, y, yaw_degrees, linear_x, angular_z)
+    mission_aborted = pyqtSignal()
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +57,7 @@ class MissionControlNode(Node):
         self.waypoints = []
         self.current_index = 0
         self.succeeded = 0
+        self._active_goal_handle = None  # tracks the in-flight Nav2 goal, for cancellation
         self._action_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
 
         # --- Telemetry: subscribe to /odom for live position/velocity ---
@@ -82,9 +84,33 @@ class MissionControlNode(Node):
             pos.x, pos.y, yaw_deg, twist.linear.x, twist.angular.z)
 
     def emergency_stop(self):
+        # Publishing zero velocity alone isn't enough -- Nav2's controller
+        # server keeps publishing its own commands to /cmd_vel ~20Hz while
+        # a goal is active, which instantly overwrites a single zero Twist.
+        # We must cancel the active goal so Nav2 itself stops driving.
+        if self._active_goal_handle is not None:
+            self.signals.log_message.emit('EMERGENCY STOP: cancelling active Nav2 goal...')
+            cancel_future = self._active_goal_handle.cancel_goal_async()
+            cancel_future.add_done_callback(self._on_cancel_done)
+        else:
+            self.signals.log_message.emit(
+                'EMERGENCY STOP: no active goal to cancel, publishing zero velocity anyway.')
+
         stop_msg = Twist()  # all fields default to 0.0
         self._cmd_vel_pub.publish(stop_msg)
         self.signals.log_message.emit('EMERGENCY STOP: zero velocity published to /cmd_vel')
+
+        # Halt the mission loop -- don't let dispatch_next() send another goal.
+        self.current_index = len(self.waypoints)
+        self.signals.mission_aborted.emit()
+
+    def _on_cancel_done(self, future):
+        cancel_response = future.result()
+        if len(cancel_response.goals_canceling) > 0:
+            self.signals.log_message.emit('Nav2 confirmed goal cancellation.')
+        else:
+            self.signals.log_message.emit(
+                'Nav2 reported no goals were cancelled (goal may have already finished).')
 
     def start_mission(self, waypoints):
         self.waypoints = waypoints
@@ -137,6 +163,7 @@ class MissionControlNode(Node):
             self.current_index += 1
             self.dispatch_next()
             return
+        self._active_goal_handle = goal_handle
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(self.result_callback)
 
@@ -146,6 +173,7 @@ class MissionControlNode(Node):
         self.signals.log_message.emit(f'Feedback: distance remaining = {distance:.2f} m')
 
     def result_callback(self, future):
+        self._active_goal_handle = None
         result = future.result()
         status = result.status
         succeeded = (status == 4)
@@ -285,6 +313,7 @@ class MainWindow(QMainWindow):
         self.signals.server_unavailable.connect(self.on_server_unavailable)
         self.signals.goal_rejected.connect(self.on_goal_rejected)
         self.signals.odom_updated.connect(self.on_odom_updated)
+        self.signals.mission_aborted.connect(self.on_mission_aborted)
 
         # Cross-thread triggers: connect with queued connections so these
         # actually execute on the ROS thread, not the GUI thread.
@@ -351,6 +380,10 @@ class MainWindow(QMainWindow):
     def on_estop_clicked(self):
         self.request_estop.emit()
         self.log('Emergency stop requested by operator.')
+
+    def on_mission_aborted(self):
+        self.status_label.setText('Mission aborted (emergency stop)')
+        self.dispatch_button.setEnabled(True)
 
     def on_odom_updated(self, x, y, yaw_deg, linear_x, angular_z):
         self.telem_x_label.setText(f'{x:.2f} m')
