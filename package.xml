@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-stylesheet type="text/xsl" href="http://download.ros.org/schema/package_format3.xsd"?>
+<package format="3">
+  <name>mission_control_gui</name>
+  <version>0.0.1</version>
+  <description>
+    Mission Control GUI for Project Kratos Autonomous Subsystem.
+    A PyQt5 dashboard that embeds a ROS 2 action client, dispatching
+    waypoints to Nav2's /navigate_to_pose action server and displaying
+    live telemetry from the Genesis-simulated TurtleBot.
+  </description>
+  <maintainer email="f20250598@goa.bits-pilani.ac.in">jay12</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <!-- PyQt5 is a plain pip/apt Python package, not a ROS package,
+       so it is not declared as a rosdep dependency here. It is listed
+       in the README's "Dependencies" section instead. -->
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
